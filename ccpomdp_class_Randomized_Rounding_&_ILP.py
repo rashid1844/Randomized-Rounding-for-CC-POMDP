@@ -23,6 +23,7 @@ class Node(object):
         self.total_safe_probability = 1. if not self.parent else self.parent.total_safe_probability * self.parent.safe_post_probability[parent_idx]
         self.reward = reward  # expected for the whole action
         self.risk = 0.0  # expected for the whole action
+        self.r_q = 0.0  # abulate risk value without prob
         self.soft_terminal = False
         self.terminal = False
         self.depth = 0 if not self.parent else 1 + self.parent.depth
@@ -164,13 +165,15 @@ def calc_min_risk(node_count, terminal_node_count,risk_list, child_list_idx_list
 
 
 class CCPOMDP:
-    def __init__(self, initial_belief, model=None, prune=False, rounding_min_iteration=0, greedy_iteration=0, greedy_advanced=False):  # action_list, trans_prob, obs_prob, t_horizon, s_horizon, reward_func, risk_func,duration_func, cc, reset_actions):
+    def __init__(self, initial_belief, model=None, prune=False, rounding_min_iteration=0, greedy_iteration=0, greedy_advanced=False, prev_state_reward=False):  # action_list, trans_prob, obs_prob, t_horizon, s_horizon, reward_func, risk_func,duration_func, cc, reset_actions):
         self.initial_belief = initial_belief  # np.array
         self.model = model
 
         self.rounding_min_iteration = rounding_min_iteration
         self.greedy_iteration = greedy_iteration
         self.greedy_advanced = greedy_advanced
+
+        self.prev_state_reward = prev_state_reward  # if True, reward & risk are based on previous state and action
 
         self.tree_expand_time = 0
         self.LP_time = 0
@@ -186,6 +189,8 @@ class CCPOMDP:
         self.open_nodes = []
         #self.node_names = {}
         self.BFS_tree = []
+
+        self.maximize = 'max' in self.model.optimization.lower()
 
         self.integral_sol = False
         self.feasible = False
@@ -320,7 +325,7 @@ class CCPOMDP:
         self.reward_list.append(b0.reward)
         self.parent_act_idx_list.append(-1)
         self.depth_idx_list[0] = 0  # for root
-        max_obs = len(self.model.obs_function(0))
+        max_obs = len(self.model.obs_function(2))
         max_act = len(self.model.action_feasibility(self.initial_belief))
         print('max_obs', max_obs)
         #b0.parent_risk_prob_safe = 1.0
@@ -338,12 +343,22 @@ class CCPOMDP:
                     max_act = max(max_act, node_action_idx+1)
                     safe_prior = self.model.calc_safe_prior(node.safe_post[obs_idx], node_action_idx)
                     new_node = Node(parent=node, parent_idx=obs_idx, action_idx=node_action_idx, safe_prior=safe_prior, safe_post_probability=[], safe_post=[], BFS_index=BFS_index)
-                    new_node.parent_risk_prob_safe = node.parent_risk_prob_safe * (1 - self.model.calc_risk(node.safe_post[obs_idx], new_node.action_idx)) * node.safe_post_probability[obs_idx]
+                    #new_node.parent_risk_prob_safe = node.parent_risk_prob_safe * (1 - self.model.calc_risk(node.safe_post[obs_idx], new_node.action_idx)) * node.safe_post_probability[obs_idx]
+                    new_node.parent_risk_prob_safe = node.parent_risk_prob_safe * (1 - node.r_q) * node.safe_post_probability[obs_idx]
                     new_node.terminal = new_node.depth >= self.model.s_horizon  # or new_node.total_duration >= self.model.t_horizon
                     new_node.soft_terminal = True if new_node.depth >= self.model.soft_horizon else False
-                    new_node.risk = self.model.calc_risk(safe_prior, new_node.action_idx) * new_node.parent_risk_prob_safe
-                    new_node.reward = self.model.compute_reward(safe_prior, node_action_idx) * new_node.parent_risk_prob_safe  # TODO: pick reward based on prev_safe post or safe_prior
-                    #new_node.reward = self.model.compute_reward(node.safe_post[obs_idx], node_action_idx) * new_node.parent_risk_prob_safe
+                    if self.prev_state_reward:
+                        new_node.r_q = self.model.calc_risk(node.safe_post[obs_idx], new_node.action_idx)
+                    else:
+                        new_node.r_q = self.model.calc_risk(safe_prior, new_node.action_idx)
+
+
+                    new_node.risk = new_node.r_q * new_node.parent_risk_prob_safe
+                    if self.prev_state_reward:
+                        new_node.reward = self.model.compute_reward(node.safe_post[obs_idx], node_action_idx) * new_node.parent_risk_prob_safe
+                    else:
+                        new_node.reward = self.model.compute_reward(safe_prior, node_action_idx) * new_node.parent_risk_prob_safe
+
                     if self.depth_idx_list[new_node.depth] == -1:  # has not been set yet, so this node is first node in this depth
                         self.depth_idx_list[new_node.depth] = new_node.BFS_index
                     # new_node observations
@@ -448,6 +463,7 @@ class CCPOMDP:
 
                 print('new number of nodes', len(self.BFS_tree))
                 print('prune time', time.time() - s_time)
+                print('total time', self.tree_expand_time + time.time() - s_time)
                 #raise RuntimeError('prune done')
         self.prune_node_count = len(self.BFS_tree)
         self.prune_time = time.time() - s_time
@@ -492,7 +508,7 @@ class CCPOMDP:
             print('time1', time.time()-s_time)
 
             # Objective
-            if 'max' in self.model.optimization.lower():
+            if self.maximize:
                 m.setObjective(quicksum(gurobi_var[i] * node.reward for i, node in enumerate(self.BFS_tree)), GRB.MAXIMIZE)
             else:
                 m.setObjective(quicksum(gurobi_var[i] * node.reward for i, node in enumerate(self.BFS_tree)), GRB.MINIMIZE)
@@ -569,7 +585,7 @@ class CCPOMDP:
 
         else:
             obj_val = m.objVal
-            max_obj = float('-inf') if 'max' in self.model.optimization.lower() else float('inf')  # max objective per iteration
+            max_obj = float('-inf') if self.maximize else float('inf')  # max objective per iteration
             max_obj_var_list = None  # list of obj per iteration
             iteration = 0  # iteration counter
             depth_exp_risk = np.zeros(self.model.s_horizon+1, np.float64)  # expected risk per depth
@@ -591,9 +607,9 @@ class CCPOMDP:
             opt_factor = 2**(self.model.s_horizon-1)
 
             #for _ in range(k):
-            while (not self.feasible) or (iteration < self.rounding_min_iteration) or (max_obj < obj_val/opt_factor and max_obj > 0 and self.prune):  #TODO: optimallity condition
+            while (not self.feasible) or (iteration < self.rounding_min_iteration) or (max_obj < obj_val/opt_factor and max_obj > 0 and self.prune and self.maximize):  #TODO: optimallity condition
                 iteration += 1
-                #print('k val', iteration)
+                #print('k val', iteration, self.feasible)
                 gurobi_list_copy = np.copy(gurobi_var_list)
 
                 if iteration <= self.greedy_iteration:
@@ -608,9 +624,9 @@ class CCPOMDP:
                                                         self.risk_list, self.reward_list, self.parent_idx_list,
                                                                     self.child_list_idx_list, self.parent_act_idx_list, self.prune, self.prune_idx_list)
 
-                if risk_sum <= self.model.cc:
+                if risk_sum <= self.model.cc + 10**-3:
                     self.feasible = True
-                    if 'max' in self.model.optimization.lower() and objective >= max_obj or 'min' in self.model.optimization.lower() and objective <= max_obj:
+                    if self.maximize and objective >= max_obj or not self.maximize and objective <= max_obj:
                         max_obj = objective
                         max_obj_var_list = gurobi_list_copy
 
@@ -655,7 +671,7 @@ class CCPOMDP:
             #        m.addConstr(gurobi_var[node.name] == 0)
 
             # Objective
-            if 'max' in self.model.optimization.lower():
+            if self.maximize:
                 m.setObjective(quicksum(gurobi_var[i] * node.reward for i, node in enumerate(self.BFS_tree)), GRB.MAXIMIZE)
             else:
                 m.setObjective(quicksum(gurobi_var[i] * node.reward for i, node in enumerate(self.BFS_tree)), GRB.MINIMIZE)
@@ -744,7 +760,7 @@ def randomized_rounding(gurobi_list_copy, cc, risk_list, reward_list, parent_lis
     risk_sum = 0.
     objective = 0.
     for index, var in enumerate(gurobi_list_copy):
-        if risk_sum > cc:
+        if risk_sum > cc + 10**-3:
             break
         # Case: parent not selected
         if index != 0 and gurobi_list_copy[parent_list[index]] == 0.:
@@ -808,7 +824,7 @@ def randomized_rounding_greedy(gurobi_list_copy, cc, risk_list, reward_list, par
     selected_exp_risk_list = np.array([-1] * len(depth_idx_list), np.float64)
 
     for index, var in enumerate(gurobi_list_copy):
-        if risk_sum > cc:
+        if risk_sum > cc + 10**-3:
             break
 
         # Case: parent not selected
